@@ -1,21 +1,24 @@
+from __future__ import annotations
+
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from PIL import Image
+if TYPE_CHECKING:
+    from PIL import Image
 
-from wllm_omni.config import DEFAULT_IMAGE, DEFAULT_MODEL, DEFAULT_PROMPT, EngineConfig
+from wllm_omni.config import DEFAULT_IMAGE, DEFAULT_MODEL, DEFAULT_PROMPT, PIPELINE_WAN_I2V, EngineConfig
 from wllm_omni.engine.mini_omni_runtime import MiniOmniTrace, MiniOmniRuntime
 from wllm_omni.engine.diffusion_engine import DiffusionEngine
 from wllm_omni.outputs import OmniOutput
 from wllm_omni.request import OmniRequest
 from wllm_omni.sampling_params import PRESETS, OmniSamplingParams, clone_sampling_params
-from wllm_omni.utils import save_video
 
 
 class OmniLLM:
 
     def __init__(self, model: str = DEFAULT_MODEL, **kwargs):
         self.config = EngineConfig(model=model, **kwargs)
-        if self.config.enable_mini_omni:
+        if self.config.enable_mini_omni or self.config.pipeline != PIPELINE_WAN_I2V:
             self.engine = MiniOmniRuntime(self.config)
         else:
             self.engine = DiffusionEngine(self.config)
@@ -26,9 +29,15 @@ class OmniLLM:
 
     def generate_ar(self, prompt: str = DEFAULT_PROMPT):
         if not hasattr(self.engine, "generate_ar"):
-            raise RuntimeError("AR-only generation requires enable_mini_omni=True.")
+            raise RuntimeError("AR generation requires pipeline='ar_text'.")
         request = OmniRequest(prompt=prompt)
         return self.engine.generate_ar(request)
+
+    def generate_ar_stream(self, prompt: str = DEFAULT_PROMPT):
+        if not hasattr(self.engine, "generate_ar_stream"):
+            raise RuntimeError("AR streaming requires pipeline='ar_text'.")
+        request = OmniRequest(prompt=prompt)
+        yield from self.engine.generate_ar_stream(request)
 
     @staticmethod
     def preset(name: str) -> OmniSamplingParams:
@@ -53,4 +62,6 @@ class OmniLLM:
         return outputs[0]
 
     def save(self, output: OmniOutput, output_path: str | Path):
+        from wllm_omni.utils import save_video
+
         save_video(output.frames, output_path, output.fps)

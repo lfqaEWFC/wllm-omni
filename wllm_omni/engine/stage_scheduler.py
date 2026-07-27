@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from time import perf_counter
+from typing import TYPE_CHECKING
 
 from wllm_omni.engine.connectors import ConnectorContext
 from wllm_omni.engine.stage import Stage, StageOutput
 from wllm_omni.engine.stage_graph import StageGraph, StageNode, StageResultStore
-from wllm_omni.request import OmniRequest
+
+if TYPE_CHECKING:
+    from wllm_omni.request import OmniRequest
 
 
 @dataclass(slots=True)
@@ -139,6 +142,11 @@ class StageScheduler:
         if in_edges:
             metadata.setdefault("source_node", in_edges[0].source)
             metadata.setdefault("source_request_id", root_request.request_id)
+            metadata.setdefault("bridge", "ar_text_to_diffusion_prompt")
+        elif node.node_id == "diffusion.wan22_i2v":
+            metadata.setdefault("source_node", None)
+            metadata.setdefault("source_request_id", None)
+            metadata.setdefault("bridge", "direct_request")
         return StageExecutionRecord(
             node_id=node.node_id,
             stage_name=node.stage.name,

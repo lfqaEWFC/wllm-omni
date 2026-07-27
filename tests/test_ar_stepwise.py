@@ -24,7 +24,7 @@ import copy
 import pytest
 import torch
 
-from wllm_omni.config import EngineConfig
+from wllm_omni.config import AR_PROMPT_MODE_I2V_BRIDGE, AR_PROMPT_MODE_TEXT, EngineConfig
 from wllm_omni.engine.ar_engine import AREngine
 from wllm_omni.model_types import ModelParadigm
 from wllm_omni.models import supports_step_execution
@@ -106,12 +106,23 @@ class _FakeTokenizer:
         return [str(i) for i in ids]
 
 
+class _RecordingTokenizer(_FakeTokenizer):
+    def __init__(self):
+        super().__init__()
+        self.last_text = None
+
+    def __call__(self, text, return_tensors="pt"):
+        self.last_text = text
+        return super().__call__(text, return_tensors=return_tensors)
+
+
 def _make_pipeline(model=None, max_new_tokens: int = MAX_NEW_TOKENS) -> TransformersARPipeline:
     pipeline = TransformersARPipeline.__new__(TransformersARPipeline)
     pipeline.model_path = "tiny/qwen2"
     pipeline.device = torch.device("cpu")
     pipeline.dtype = torch.float32
     pipeline.max_new_tokens = max_new_tokens
+    pipeline.prompt_mode = AR_PROMPT_MODE_TEXT
     pipeline.tokenizer = _FakeTokenizer()
     pipeline.model = model if model is not None else _tiny_qwen2_model()
     return pipeline
@@ -119,7 +130,7 @@ def _make_pipeline(model=None, max_new_tokens: int = MAX_NEW_TOKENS) -> Transfor
 
 def _reference_generate(pipeline: TransformersARPipeline, max_new_tokens: int = MAX_NEW_TOKENS) -> list[int]:
     """What the pre-P0 monolithic path produced: raw model.generate() ids."""
-    inputs = pipeline._tokenize_prompt(pipeline._build_prompt("hello world"))
+    inputs = pipeline._tokenize_prompt("hello world")
     with torch.no_grad():
         output_ids = pipeline.model.generate(
             **inputs,
@@ -139,6 +150,21 @@ def _stepwise_output(pipeline: TransformersARPipeline) -> ARTextOutput:
         steps += 1
         assert steps <= pipeline.max_new_tokens, "decode loop must stop at max_new_tokens"
     return pipeline.finalize(state)
+
+
+def test_transformers_prompt_mode_controls_template_for_non_chat_tokenizer():
+    pipeline = _make_pipeline()
+    tokenizer = _RecordingTokenizer()
+    pipeline.tokenizer = tokenizer
+
+    pipeline.prompt_mode = AR_PROMPT_MODE_TEXT
+    pipeline._tokenize_prompt("生成1000字的文本，描述一所学校")
+    assert tokenizer.last_text == "生成1000字的文本，描述一所学校"
+
+    pipeline.prompt_mode = AR_PROMPT_MODE_I2V_BRIDGE
+    pipeline._tokenize_prompt("A cat on a surfboard")
+    assert "Rewrite the following image-to-video request" in tokenizer.last_text
+    assert "Request: A cat on a surfboard" in tokenizer.last_text
 
 
 def test_stepwise_matches_generate_default_config():
@@ -386,9 +412,9 @@ def test_identity_pipeline_single_shot_behavior_unchanged():
     assert state.finished is True
 
 
-def test_ar_engine_drives_multi_step_decode_with_unchanged_scheduler():
-    """AREngine/RequestScheduler need zero changes: their per-step loop keeps
-    re-scheduling running requests until the executor reports finished."""
+def test_ar_engine_drives_multi_step_decode_with_request_scheduler():
+    """AREngine/RequestScheduler keeps re-scheduling running requests until
+    the executor reports finished."""
     pipeline = _FakeStepwisePipeline()
     engine = AREngine(EngineConfig(enable_mini_omni=True), pipeline=pipeline)
 

@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from PIL import Image
+if TYPE_CHECKING:
+    from PIL import Image
 
 from wllm_omni.config import DEFAULT_IMAGE, DEFAULT_PROMPT
 from wllm_omni.model_types import ModelParadigm

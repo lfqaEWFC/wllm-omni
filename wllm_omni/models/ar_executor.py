@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 from wllm_omni.model_types import ModelParadigm
 from wllm_omni.models import ModelExecutor, supports_step_execution
-from wllm_omni.models.ar_pipeline import ARPipeline, ARTextOutput, IdentityARPipeline
+from wllm_omni.models.ar_pipeline import ARPipeline, ARStepOutput, ARTextOutput, IdentityARPipeline
 from wllm_omni.worker.utils import (
     ExecutionPhase,
     ExecutorCapability,
@@ -36,6 +37,11 @@ class ARState:
     decode: Any = None
     output: ARTextOutput | None = None
     step_index: int = 0
+    emitted_token_count: int = 0
+    prefill_elapsed_s: float = 0.0
+    decode_elapsed_s: float = 0.0
+    prefill_steps: int = 0
+    decode_steps: int = 0
 
 
 class ARExecutor(ModelExecutor):
@@ -60,8 +66,9 @@ class ARExecutor(ModelExecutor):
     # is kept as-is from V0 rather than extended with more ornamental flags.
     capabilities = frozenset({ExecutorCapability.STEPWISE, ExecutorCapability.STREAMING})
 
-    def __init__(self, pipeline: ARPipeline | None = None):
+    def __init__(self, pipeline: ARPipeline | None = None, *, emit_stream_events: bool = False):
         self.pipeline = pipeline or IdentityARPipeline()
+        self.emit_stream_events = emit_stream_events
         self._stepwise = supports_step_execution(self.pipeline, AR_STEP_EXECUTION_METHODS)
 
     def init_state(self, sched_req_id: str, request: OmniRequest) -> RequestState:
@@ -104,21 +111,36 @@ class ARExecutor(ModelExecutor):
 
         ar_state = self._batch_payload(batch)
         ar_state.step_index += 1
+        events: list[ARStepOutput] = []
 
         if batch.phase == ExecutionPhase.FINALIZE:
+            start = perf_counter()
             ar_state.output = self.pipeline.generate(ar_state.request)
+            ar_state.decode_elapsed_s += perf_counter() - start
+            events = self._final_output_stream_events(ar_state)
         elif batch.phase == ExecutionPhase.PREPARE:
+            start = perf_counter()
             ar_state.decode = self.pipeline.prefill(ar_state.request)
+            ar_state.prefill_elapsed_s += perf_counter() - start
+            ar_state.prefill_steps += 1
+            events = self._stream_events(ar_state)
         else:
             if ar_state.decode is None:
                 raise ValueError("ARExecutor got a STEP batch without prefilled decode state.")
+            start = perf_counter()
             ar_state.decode = self.pipeline.decode_step(ar_state.decode)
+            ar_state.decode_elapsed_s += perf_counter() - start
+            ar_state.decode_steps += 1
+            events = self._stream_events(ar_state)
 
         if ar_state.output is None and ar_state.decode.finished:
             ar_state.output = self.pipeline.finalize(ar_state.decode)
+            self._attach_runtime_metadata(ar_state)
             # The KV cache is dead weight once the output exists; drop it now
             # instead of keeping it alive until release().
             ar_state.decode = None
+        elif ar_state.output is not None:
+            self._attach_runtime_metadata(ar_state)
 
         finished = ar_state.output is not None
         runner_output = RunnerOutput(
@@ -126,10 +148,68 @@ class ARExecutor(ModelExecutor):
             step_index=ar_state.step_index,
             finished=finished,
             result=ar_state.output if finished else None,
+            events=events,
         )
         return ModelForwardOutput(outputs=[runner_output], payload=ar_state)
 
     # update_states / collect_outputs / release use the ModelExecutor defaults.
+
+    def _stream_events(self, ar_state: ARState) -> list[ARStepOutput]:
+        if not self.emit_stream_events or ar_state.decode is None:
+            return []
+        stream_events = getattr(self.pipeline, "stream_events", None)
+        if not callable(stream_events):
+            return []
+        events = stream_events(ar_state.decode, ar_state.emitted_token_count)
+        ar_state.emitted_token_count += len(events)
+        return events
+
+    def _final_output_stream_events(self, ar_state: ARState) -> list[ARStepOutput]:
+        if not self.emit_stream_events or ar_state.output is None:
+            return []
+        token_id = ar_state.output.token_ids[0] if ar_state.output.token_ids else -1
+        token = ar_state.output.tokens[0] if ar_state.output.tokens else ar_state.output.text
+        ar_state.emitted_token_count = len(ar_state.output.token_ids)
+        return [
+            ARStepOutput(
+                request_id=ar_state.output.request_id,
+                token_index=0,
+                token_id=token_id,
+                token=token,
+                text_delta=ar_state.output.text,
+                finished=True,
+                metadata={
+                    "mode": ar_state.output.metadata.get("mode"),
+                    "model": ar_state.output.metadata.get("model"),
+                },
+            )
+        ]
+
+    @staticmethod
+    def _attach_runtime_metadata(ar_state: ARState) -> None:
+        if ar_state.output is None:
+            return
+        total_elapsed_s = ar_state.prefill_elapsed_s + ar_state.decode_elapsed_s
+        decode_step_mean_ms = (
+            ar_state.decode_elapsed_s * 1000.0 / ar_state.decode_steps
+            if ar_state.decode_steps > 0
+            else 0.0
+        )
+        metadata = ar_state.output.metadata
+        metadata.setdefault("streaming", False)
+        metadata.setdefault("kv_cache_backend", metadata.get("kv_cache_type"))
+        ar_state.output.metadata.update(
+            scheduler_steps=ar_state.step_index,
+            prefill_steps=ar_state.prefill_steps,
+            decode_steps=ar_state.decode_steps,
+            decode_model_calls=ar_state.decode_steps,
+            decode_scheduler_steps=ar_state.decode_steps,
+            prefill_ms=ar_state.prefill_elapsed_s * 1000.0,
+            decode_ms=ar_state.decode_elapsed_s * 1000.0,
+            elapsed_ms=total_elapsed_s * 1000.0,
+            ttft_ms=ar_state.prefill_elapsed_s * 1000.0 if ar_state.prefill_steps else None,
+            decode_step_mean_ms=decode_step_mean_ms,
+        )
 
     @staticmethod
     def _state_payload(state: RequestState) -> ARState:
