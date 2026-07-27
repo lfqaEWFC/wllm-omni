@@ -95,6 +95,7 @@ class RunnerOutput:
     finished: bool = False
     result: Any = None
     error: str | None = None
+    events: list[Any] = field(default_factory=list)
 
 
 @dataclass(slots=True)

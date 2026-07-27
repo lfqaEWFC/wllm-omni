@@ -1,7 +1,15 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - lightweight import path
+    class _TorchStub:
+        dtype = object
+        bfloat16 = "bfloat16"
+        float32 = "float32"
+
+    torch = _TorchStub()
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -23,6 +31,15 @@ DEFAULT_NEGATIVE_PROMPT = (
     "duplicate subject, motion trails, afterimage, frame blending"
 )
 
+PIPELINE_WAN_I2V = "wan_i2v"
+PIPELINE_AR_TEXT = "ar_text"
+PIPELINE_QWEN_TO_WAN_I2V = "qwen_to_wan_i2v"
+SUPPORTED_PIPELINES = (PIPELINE_WAN_I2V, PIPELINE_AR_TEXT, PIPELINE_QWEN_TO_WAN_I2V)
+
+AR_PROMPT_MODE_TEXT = "text"
+AR_PROMPT_MODE_I2V_BRIDGE = "i2v_bridge"
+SUPPORTED_AR_PROMPT_MODES = (AR_PROMPT_MODE_TEXT, AR_PROMPT_MODE_I2V_BRIDGE)
+
 
 @dataclass(slots=True)
 class EngineConfig:
@@ -40,5 +57,6 @@ class EngineConfig:
     enable_profiling: bool = False
     probe_condition_cache: bool = False
     enable_mini_omni: bool = False
+    pipeline: str = PIPELINE_WAN_I2V
     ar_model: str | None = None
     ar_max_new_tokens: int = 64

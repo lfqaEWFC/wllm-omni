@@ -36,6 +36,74 @@ class StageResultStore:
         return node_id in self.outputs
 
 
+@dataclass(frozen=True, slots=True)
+class PipelineEdgeConfig:
+    source: str
+    target: str
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineConfig:
+    name: str
+    nodes: tuple[str, ...]
+    edges: tuple[PipelineEdgeConfig, ...] = ()
+
+
+class PipelineRegistry:
+    """Registry of explicit mini-Omni pipeline graphs.
+
+    The registry describes top-level stage composition only. It does not know
+    token scheduling, KV cache layout, or diffusion denoise steps.
+    """
+
+    def __init__(self, configs: list[PipelineConfig] | None = None):
+        self._configs: dict[str, PipelineConfig] = {}
+        for config in configs or []:
+            self.register(config)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._configs)
+
+    def register(self, config: PipelineConfig) -> None:
+        if not config.nodes:
+            raise ValueError(f"Pipeline {config.name!r} requires at least one stage node.")
+        if config.name in self._configs:
+            raise ValueError(f"Duplicate pipeline name={config.name!r}.")
+        self._configs[config.name] = config
+
+    def get(self, name: str) -> PipelineConfig:
+        try:
+            return self._configs[name]
+        except KeyError as exc:
+            known = ", ".join(self.names)
+            raise ValueError(f"Unsupported pipeline={name!r}; supported pipelines: {known}.") from exc
+
+    def build_graph(
+        self,
+        name: str,
+        *,
+        stages: dict[str, Stage],
+        connectors: dict[tuple[str, str], StageConnector],
+    ) -> "StageGraph":
+        config = self.get(name)
+        graph = StageGraph()
+        for node_id in config.nodes:
+            try:
+                stage = stages[node_id]
+            except KeyError as exc:
+                raise KeyError(f"Pipeline {name!r} references unknown stage node={node_id!r}.") from exc
+            graph.add_node(node_id, stage)
+        for edge in config.edges:
+            key = (edge.source, edge.target)
+            try:
+                connector = connectors[key]
+            except KeyError as exc:
+                raise KeyError(f"Pipeline {name!r} references missing connector edge={key!r}.") from exc
+            graph.add_edge(edge.source, edge.target, connector)
+        return graph
+
+
 class StageGraph:
     """A small explicit stage DAG for mini-Omni V1.
 

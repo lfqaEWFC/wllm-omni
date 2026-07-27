@@ -22,9 +22,12 @@ def __getattr__(name: str):
 
         return getattr(config, name)
     if name in {"MiniOmniRuntime", "MiniOmniTrace"}:
-        from wllm_omni.engine import mini_omni_runtime
+        from wllm_omni.engine.mini_omni_runtime import MiniOmniRuntime, MiniOmniTrace
 
-        return getattr(mini_omni_runtime, name)
+        return {
+            "MiniOmniRuntime": MiniOmniRuntime,
+            "MiniOmniTrace": MiniOmniTrace,
+        }[name]
     if name == "OmniLLM":
         from wllm_omni.llm import OmniLLM
 

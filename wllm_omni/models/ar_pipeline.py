@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 import hashlib
 from typing import TYPE_CHECKING, Any
 
+from wllm_omni.config import AR_PROMPT_MODE_I2V_BRIDGE, AR_PROMPT_MODE_TEXT, SUPPORTED_AR_PROMPT_MODES
+
 if TYPE_CHECKING:
     from wllm_omni.request import OmniRequest
 
@@ -15,6 +17,17 @@ class ARTextOutput:
     text: str
     tokens: list[str]
     token_ids: list[int]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ARStepOutput:
+    request_id: str
+    token_index: int
+    token_id: int
+    token: str
+    text_delta: str
+    finished: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -58,6 +71,9 @@ class ARPipeline(ABC):
     def generate(self, request: OmniRequest) -> ARTextOutput:
         pass
 
+    def stream_events(self, state: Any, emitted_token_count: int) -> list[ARStepOutput]:
+        return []
+
 
 class IdentityARPipeline(ARPipeline):
     """Deterministic AR placeholder used before a real causal LM backend."""
@@ -72,7 +88,18 @@ class IdentityARPipeline(ARPipeline):
             token_ids=[self._stable_token_id(token) for token in tokens],
             metadata={
                 "mode": "identity_prompt_bridge",
+                "prompt_mode": "text",
+                "input_tokens": len(tokens),
+                "prefill_tokens": len(tokens),
                 "token_count": len(tokens),
+                "generated_tokens": len(tokens),
+                "stop_reason": "identity",
+                "streaming": False,
+                "kv_cache": False,
+                "kv_cache_type": None,
+                "kv_cache_backend": None,
+                "kv_cache_source": None,
+                "runtime_kv_manager": False,
             },
         )
 
@@ -113,6 +140,7 @@ class TransformersARPipeline(ARPipeline):
         dtype: Any = None,
         local_files_only: bool = True,
         max_new_tokens: int = 64,
+        prompt_mode: str = AR_PROMPT_MODE_TEXT,
     ):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -120,7 +148,10 @@ class TransformersARPipeline(ARPipeline):
         self.model_path = model
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
         self.dtype = dtype or torch.bfloat16
+        if prompt_mode not in SUPPORTED_AR_PROMPT_MODES:
+            raise ValueError(f"Unsupported AR prompt_mode={prompt_mode!r}.")
         self.max_new_tokens = max_new_tokens
+        self.prompt_mode = prompt_mode
         self.tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=local_files_only, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model,
@@ -147,8 +178,7 @@ class TransformersARPipeline(ARPipeline):
         import torch
         from transformers.generation import LogitsProcessorList, StoppingCriteriaList
 
-        prompt = self._build_prompt(request.prompt)
-        inputs = self._tokenize_prompt(prompt)
+        inputs = self._tokenize_prompt(request.prompt)
         input_ids = inputs.input_ids
         attention_mask = inputs.get("attention_mask")
         if attention_mask is None:
@@ -217,6 +247,7 @@ class TransformersARPipeline(ARPipeline):
             text = state.prompt.strip()
         token_ids = [int(item) for item in generated_ids.detach().cpu().tolist()]
         tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
+        cache_type = type(state.cache).__name__ if state.cache is not None else None
         return ARTextOutput(
             request_id=state.request_id,
             text=text,
@@ -225,10 +256,50 @@ class TransformersARPipeline(ARPipeline):
             metadata={
                 "mode": "transformers_causal_lm",
                 "model": self.model_path,
+                "prompt_mode": self.prompt_mode,
                 "input_tokens": state.input_length,
+                "prefill_tokens": state.input_length,
                 "token_count": len(token_ids),
+                "generated_tokens": len(token_ids),
+                "stop_reason": self._stop_reason(len(token_ids)),
+                "streaming": False,
+                "kv_cache": state.cache is not None,
+                "kv_cache_type": cache_type,
+                "kv_cache_backend": cache_type,
+                "kv_cache_source": "transformers_past_key_values" if state.cache is not None else None,
+                "runtime_kv_manager": False,
             },
         )
+
+    def stream_events(self, state: ARDecodeState, emitted_token_count: int) -> list[ARStepOutput]:
+        generated_ids = state.input_ids[0, state.input_length:]
+        total = int(generated_ids.shape[-1])
+        if emitted_token_count >= total:
+            return []
+        events: list[ARStepOutput] = []
+        for token_offset in range(emitted_token_count, total):
+            token_id = int(generated_ids[token_offset].detach().cpu().item())
+            prev_ids = generated_ids[:token_offset]
+            cur_ids = generated_ids[: token_offset + 1]
+            prev_text = self.tokenizer.decode(prev_ids, skip_special_tokens=True) if token_offset > 0 else ""
+            cur_text = self.tokenizer.decode(cur_ids, skip_special_tokens=True)
+            text_delta = cur_text[len(prev_text):]
+            events.append(
+                ARStepOutput(
+                    request_id=state.request_id,
+                    token_index=token_offset,
+                    token_id=token_id,
+                    token=self.tokenizer.convert_ids_to_tokens([token_id])[0],
+                    text_delta=text_delta,
+                    finished=state.finished and token_offset == total - 1,
+                    metadata={
+                        "mode": "transformers_causal_lm",
+                        "model": self.model_path,
+                        "prompt_mode": self.prompt_mode,
+                    },
+                )
+            )
+        return events
 
     def _step(self, state: ARDecodeState) -> ARDecodeState:
         """One model forward + logits processors + argmax + stop check.
@@ -277,23 +348,43 @@ class TransformersARPipeline(ARPipeline):
         return state
 
     def _tokenize_prompt(self, prompt: str):
-        messages = [
-            {"role": "system", "content": "You rewrite user requests into concise visual prompts for image-to-video generation."},
-            {"role": "user", "content": prompt},
-        ]
         if getattr(self.tokenizer, "chat_template", None):
             return self.tokenizer.apply_chat_template(
-                messages,
+                self._build_messages(prompt),
                 add_generation_prompt=True,
                 return_tensors="pt",
                 return_dict=True,
             ).to(self.device)
-        return self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        return self.tokenizer(self._build_prompt(prompt), return_tensors="pt").to(self.device)
 
-    @staticmethod
-    def _build_prompt(prompt: str) -> str:
-        return (
-            "Rewrite the following image-to-video request as a concise, visual video generation prompt. "
-            "Keep the main subject, scene, motion, and style. Return only the rewritten prompt.\n\n"
-            f"Request: {prompt.strip()}\nPrompt:"
-        )
+    def _build_messages(self, prompt: str) -> list[dict[str, str]]:
+        if self.prompt_mode == AR_PROMPT_MODE_I2V_BRIDGE:
+            return [
+                {
+                    "role": "system",
+                    "content": (
+                        "You rewrite user requests into concise visual prompts for image-to-video generation. "
+                        "Keep the main subject, scene, motion, and style. Return only the rewritten prompt."
+                    ),
+                },
+                {"role": "user", "content": prompt.strip()},
+            ]
+        return [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt.strip()},
+        ]
+
+    def _stop_reason(self, generated_count: int) -> str:
+        if generated_count >= self.max_new_tokens:
+            return "max_tokens"
+        return "eos"
+
+    def _build_prompt(self, prompt: str) -> str:
+        text = prompt.strip()
+        if self.prompt_mode == AR_PROMPT_MODE_I2V_BRIDGE:
+            return (
+                "Rewrite the following image-to-video request as a concise, visual video generation prompt. "
+                "Keep the main subject, scene, motion, and style. Return only the rewritten prompt.\n\n"
+                f"Request: {text}\nPrompt:"
+            )
+        return text

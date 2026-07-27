@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from wllm_omni.config import EngineConfig
 from wllm_omni.engine.ar_engine import AREngine
@@ -11,7 +11,9 @@ from wllm_omni.engine.diffusion_engine import DiffusionEngine
 from wllm_omni.model_types import ModelParadigm
 from wllm_omni.models.ar_pipeline import ARPipeline, ARTextOutput
 from wllm_omni.outputs import OmniOutput
-from wllm_omni.request import OmniRequest
+
+if TYPE_CHECKING:
+    from wllm_omni.request import OmniRequest
 
 
 @dataclass(slots=True)
@@ -37,7 +39,9 @@ class ARStage(Stage):
     name = "ar.prompt_bridge"
     paradigm = ModelParadigm.AUTOREGRESSIVE
 
-    def __init__(self, config: EngineConfig, pipeline: ARPipeline | None = None):
+    def __init__(self, config: EngineConfig, pipeline: ARPipeline | None = None, *, name: str | None = None):
+        if name is not None:
+            self.name = name
         self.engine = AREngine(config, pipeline=pipeline)
 
     def run(self, request: OmniRequest) -> StageOutput:
@@ -45,13 +49,14 @@ class ARStage(Stage):
         return StageOutput(
             request_id=request.request_id,
             data=ar_output,
-            metadata={
-                "mode": ar_output.metadata.get("mode"),
-                "model": ar_output.metadata.get("model"),
-                "input_tokens": ar_output.metadata.get("input_tokens"),
-                "output_tokens": ar_output.metadata.get("token_count", len(ar_output.tokens)),
-            },
+            metadata=self.metadata_from_output(ar_output),
         )
+
+    @staticmethod
+    def metadata_from_output(ar_output: ARTextOutput) -> dict[str, Any]:
+        metadata = dict(ar_output.metadata)
+        metadata.setdefault("output_tokens", metadata.get("token_count", len(ar_output.tokens)))
+        return metadata
 
 
 class DiffusionStage(Stage):
@@ -76,9 +81,7 @@ class DiffusionStage(Stage):
         return StageOutput(
             request_id=request.request_id,
             data=outputs[0],
-            metadata={
-                "bridge": "ar_text_to_diffusion_prompt",
-            },
+            metadata={},
         )
 
     def _engine(self) -> DiffusionEngine:

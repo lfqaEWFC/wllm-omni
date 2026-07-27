@@ -1,6 +1,10 @@
-from dataclasses import dataclass, field
+from __future__ import annotations
 
-from PIL import Image
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 
 @dataclass(slots=True)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from wllm_omni.request import OmniRequest
+if TYPE_CHECKING:
+    from wllm_omni.request import OmniRequest
 from wllm_omni.sched.base_scheduler import BaseScheduler
 from wllm_omni.sched.interface import RequestStatus, SchedulerOutput, SchedulerRequestState
 from wllm_omni.worker.utils import RunnerBatchOutput, RunnerOutput
