@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 from wllm_omni.model_types import ModelParadigm
 from wllm_omni.worker.utils import (
@@ -18,8 +18,13 @@ if TYPE_CHECKING:
 STEP_EXECUTION_METHODS = ("prepare_encode", "denoise_step", "step_scheduler", "post_decode")
 
 
-def supports_step_execution(pipeline: Any) -> bool:
-    return all(callable(getattr(pipeline, name, None)) for name in STEP_EXECUTION_METHODS)
+def supports_step_execution(pipeline: Any, methods: Sequence[str] = STEP_EXECUTION_METHODS) -> bool:
+    """Duck-type check for whether a pipeline implements a step-execution contract.
+
+    Defaults to the diffusion contract so existing call sites are unaffected;
+    other paradigms (e.g. AR prefill/decode) pass their own ``methods`` tuple.
+    """
+    return all(callable(getattr(pipeline, name, None)) for name in methods)
 
 
 class ModelExecutor(ABC):
@@ -49,20 +54,40 @@ class ModelExecutor(ABC):
     def forward(self, batch: ForwardBatch) -> ModelForwardOutput:
         pass
 
-    @abstractmethod
     def update_states(self, states: list[RequestState], output: ModelForwardOutput) -> None:
-        pass
+        """Write forward results back into the runner-owned request states.
 
-    @abstractmethod
+        Progress must round-trip through ``ModelForwardOutput.payload`` (not
+        rely on states aliasing the batch payload) so executors survive a
+        worker/serialization boundary. Both current executors share this exact
+        logic; override only if a model family needs different bookkeeping.
+        """
+        output_by_req_id = {item.req_id: item for item in output.outputs}
+        for state in states:
+            item = output_by_req_id.get(state.sched_req_id)
+            if item is None:
+                continue
+            if output.payload is not None:
+                state.payload = output.payload
+                state.initialized = True
+            if item.error is not None:
+                state.error = item.error
+                state.finished = True
+            if item.step_index is not None:
+                state.step_index = item.step_index
+            if item.finished:
+                state.finished = True
+
     def collect_outputs(
         self,
         states: list[RequestState],
         output: ModelForwardOutput,
     ) -> list[RunnerOutput]:
-        pass
+        """Default: forward() already attached results to its RunnerOutputs."""
+        return output.outputs
 
     def release(self, state: RequestState) -> None:
-        pass
+        state.payload = None
 
 
 class ExecutorRegistry:
