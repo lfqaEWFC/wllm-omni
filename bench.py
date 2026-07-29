@@ -4,10 +4,11 @@ import time
 from PIL import Image
 
 from wllm_omni import DEFAULT_IMAGE, DEFAULT_PROMPT, OmniLLM
+from wllm_omni.config import PIPELINE_WAN_I2V
 
 
 def main():
-    llm = OmniLLM()
+    llm = OmniLLM(enable_mini_omni=True, pipeline=PIPELINE_WAN_I2V)
     sampling_params = llm.preset("quality")
     image = Image.open(DEFAULT_IMAGE).convert("RGB")
 

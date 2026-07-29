@@ -4,6 +4,8 @@ import contextlib
 import sys
 import types
 
+import pytest
+
 try:
     import torch  # noqa: F401
 except ModuleNotFoundError:
@@ -161,6 +163,8 @@ def test_ar_text_runtime_stream_trace_uses_pipeline_protocol():
     assert runtime.last_trace is not None
     assert runtime.last_trace.pipeline == PIPELINE_AR_TEXT
     assert runtime.last_trace.graph_nodes == ["ar.text_generation"]
+    assert runtime.stage_scheduler.last_result is not None
+    assert runtime.stage_scheduler.last_result.records[0].node_id == "ar.text_generation"
     metadata = runtime.last_trace.stages[0].metadata
     assert metadata["streaming"] is True
     assert metadata["kv_cache_type"] == "FakeCache"
@@ -184,3 +188,15 @@ def test_ar_text_streaming_falls_back_for_single_shot_pipeline():
     metadata = runtime.last_trace.stages[0].metadata
     assert metadata["streaming"] is True
     assert metadata["kv_cache"] is False
+
+
+def test_qwen_to_wan_runtime_rejects_streaming_before_stage_execution():
+    runtime = MiniOmniRuntime(
+        EngineConfig(enable_mini_omni=True, pipeline=PIPELINE_QWEN_TO_WAN_I2V),
+        ar_pipeline=_StreamPipeline(),
+    )
+
+    with pytest.raises(RuntimeError, match='does not support streaming'):
+        list(runtime.generate_ar_stream(OmniRequest(prompt='hello')))
+
+    assert runtime.stage_scheduler.last_result is None

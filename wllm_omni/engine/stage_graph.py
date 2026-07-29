@@ -105,7 +105,7 @@ class PipelineRegistry:
 
 
 class StageGraph:
-    """A small explicit stage DAG for mini-Omni V1.
+    """A small explicit stage DAG for mini-Omni V0.
 
     This is the top-level omni graph. It does not schedule tokens or diffusion
     steps; it only represents stage dependencies and inter-stage connectors.
@@ -172,7 +172,7 @@ class StageGraph:
         multi_input_nodes = [node_id for node_id, edges in self._in_edges.items() if len(edges) > 1]
         if multi_input_nodes:
             raise ValueError(
-                "StageGraph V1 supports at most one input edge per node; "
+                "StageGraph V0 supports at most one input edge per node; "
                 f"got multi-input nodes: {sorted(multi_input_nodes)}"
             )
         self._validate_reachable_from_roots(roots)

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from wllm_omni.config import AR_PROMPT_MODE_I2V_BRIDGE, AR_PROMPT_MODE_TEXT, PIPELINE_QWEN_TO_WAN_I2V, EngineConfig
+from wllm_omni.config import EngineConfig
+from wllm_omni.engine.planning import ar_stage_policy_for_pipeline
 from wllm_omni.engine.model_runner import ModelRunner
 from wllm_omni.model_types import ModelParadigm
 from wllm_omni.models.ar_executor import ARExecutor
@@ -88,12 +89,12 @@ class AREngine:
     def _make_pipeline(config: EngineConfig) -> ARPipeline | None:
         if config.ar_model is None:
             return None
-        prompt_mode = AR_PROMPT_MODE_I2V_BRIDGE if config.pipeline == PIPELINE_QWEN_TO_WAN_I2V else AR_PROMPT_MODE_TEXT
+        policy = ar_stage_policy_for_pipeline(config.pipeline)
         return TransformersARPipeline(
             config.ar_model,
             device=config.device,
             dtype=config.dtype,
             local_files_only=config.local_files_only,
-            max_new_tokens=config.ar_max_new_tokens,
-            prompt_mode=prompt_mode,
+            token_budget=policy.token_budget,
+            prompt_mode=policy.prompt_mode,
         )
