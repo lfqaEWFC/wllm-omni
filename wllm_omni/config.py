@@ -16,12 +16,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = str(REPO_ROOT / "models" / "Wan2.2-TI2V-5B-Diffusers")
 DEFAULT_IMAGE = str(REPO_ROOT / "assets" / "image.png")
 DEFAULT_PROMPT = (
-    "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. "
-    "The fluffy-furred feline gazes directly at the camera with a relaxed expression. "
-    "Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, "
-    "and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring "
-    "the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the "
-    "refreshing atmosphere of the seaside."
+    "Warm outdoor pet portrait, a young golden retriever puppy sitting on a vibrant green lawn in a park. "
+    "The puppy faces the camera with bright dark eyes, relaxed floppy ears, an open smiling mouth, and a "
+    "pink tongue. Soft natural daylight illuminates its fluffy cream-golden fur, with a shallow depth of "
+    "field blurring trees and grass in the background. Over a longer natural shot, the puppy blinks, "
+    "gently tilts its head, pants happily with its tongue out, shifts its front paw forward, leans closer "
+    "with curious eye contact, and lets its fluffy ears and chest fur move slightly in a light breeze. "
+    "Low eye-level close-up composition, stable camera, friendly and lively atmosphere, high quality "
+    "realistic video."
 )
 DEFAULT_NEGATIVE_PROMPT = (
     "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, "
@@ -35,6 +37,10 @@ PIPELINE_WAN_I2V = "wan_i2v"
 PIPELINE_AR_TEXT = "ar_text"
 PIPELINE_QWEN_TO_WAN_I2V = "qwen_to_wan_i2v"
 SUPPORTED_PIPELINES = (PIPELINE_WAN_I2V, PIPELINE_AR_TEXT, PIPELINE_QWEN_TO_WAN_I2V)
+
+AR_TEXT_NODE = "ar.text_generation"
+AR_PROMPT_BRIDGE_NODE = "ar.prompt_bridge"
+DIFFUSION_WAN_I2V_NODE = "diffusion.wan22_i2v"
 
 AR_PROMPT_MODE_TEXT = "text"
 AR_PROMPT_MODE_I2V_BRIDGE = "i2v_bridge"
@@ -59,4 +65,3 @@ class EngineConfig:
     enable_mini_omni: bool = False
     pipeline: str = PIPELINE_WAN_I2V
     ar_model: str | None = None
-    ar_max_new_tokens: int = 64

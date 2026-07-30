@@ -34,9 +34,14 @@ class Stage(ABC):
     def run(self, request: OmniRequest) -> StageOutput:
         pass
 
+    def run_stream(self, request: OmniRequest):
+        if False:
+            yield None
+        return self.run(request)
+
 
 class ARStage(Stage):
-    name = "ar.prompt_bridge"
+    name = "ar.text_generation"
     paradigm = ModelParadigm.AUTOREGRESSIVE
 
     def __init__(self, config: EngineConfig, pipeline: ARPipeline | None = None, *, name: str | None = None):
@@ -52,10 +57,24 @@ class ARStage(Stage):
             metadata=self.metadata_from_output(ar_output),
         )
 
+    def run_stream(self, request: OmniRequest):
+        for event in self.engine.generate_stream(request):
+            yield event
+        ar_output = self.engine.last_output
+        if ar_output is None:
+            raise RuntimeError("AR stream finished without output.")
+        ar_output.metadata["streaming"] = True
+        return StageOutput(
+            request_id=request.request_id,
+            data=ar_output,
+            metadata=self.metadata_from_output(ar_output),
+        )
+
     @staticmethod
     def metadata_from_output(ar_output: ARTextOutput) -> dict[str, Any]:
         metadata = dict(ar_output.metadata)
         metadata.setdefault("output_tokens", metadata.get("token_count", len(ar_output.tokens)))
+        metadata.setdefault("output_text", ar_output.text)
         return metadata
 
 

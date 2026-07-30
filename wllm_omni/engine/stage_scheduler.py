@@ -40,8 +40,39 @@ class StageScheduler:
     def __init__(self, graph: StageGraph):
         self.graph = graph
         self.graph.validate()
+        self.last_result: StageSchedulerResult | None = None
 
     def run(self, root_request: OmniRequest) -> StageSchedulerResult:
+        result = self._run(root_request)
+        self.last_result = result
+        return result
+
+    def run_stream(self, root_request: OmniRequest):
+        """Run a single-stage streaming graph and yield stage events.
+
+        Streaming remains a stage-graph operation: Runtime never calls an engine
+        directly. V0 only exposes streaming for the single-node ar_text graph;
+        multi-stage streaming will need event routing through connectors.
+        """
+
+        if len(self.graph.nodes) != 1:
+            raise RuntimeError("StageScheduler streaming currently supports single-stage graphs only.")
+
+        outputs = StageResultStore()
+        records: list[StageExecutionRecord] = []
+        node = next(iter(self.graph.nodes.values()))
+        output, elapsed_s = yield from self._run_stage_stream(node.stage, root_request)
+        outputs.put(node.node_id, output)
+        records.append(self._make_record(node, output, elapsed_s, root_request))
+        result = StageSchedulerResult(
+            root_request_id=root_request.request_id,
+            outputs=outputs,
+            records=records,
+            final_outputs=[output],
+        )
+        self.last_result = result
+
+    def _run(self, root_request: OmniRequest) -> StageSchedulerResult:
         outputs = StageResultStore()
         records: list[StageExecutionRecord] = []
         completed: set[str] = set()
@@ -87,7 +118,7 @@ class StageScheduler:
         in_edges = self.graph.in_edges(node.node_id)
         if len(in_edges) != 1:
             raise RuntimeError(
-                f"Stage node {node.node_id!r} requires exactly one input request in V1, got {len(in_edges)}."
+                f"Stage node {node.node_id!r} requires exactly one input request in V0, got {len(in_edges)}."
             )
         edge = in_edges[0]
         context = ConnectorContext(
@@ -124,8 +155,35 @@ class StageScheduler:
         start = perf_counter()
         output = stage.run(request)
         elapsed_s = perf_counter() - start
+        return StageScheduler._finalize_stage_output(output, prepare_metadata, request, elapsed_s)
+
+    @staticmethod
+    def _run_stage_stream(stage: Stage, request: OmniRequest):
+        prepare_metadata = stage.prepare()
+        start = perf_counter()
+        stream = stage.run_stream(request)
+        try:
+            while True:
+                yield next(stream)
+        except StopIteration as stop:
+            output = stop.value
+        elapsed_s = perf_counter() - start
+        if output is None:
+            raise RuntimeError(f"Streaming stage {stage.name!r} finished without StageOutput.")
+        return StageScheduler._finalize_stage_output(output, prepare_metadata, request, elapsed_s)
+
+    @staticmethod
+    def _finalize_stage_output(
+        output: StageOutput,
+        prepare_metadata: dict[str, object],
+        request: OmniRequest,
+        elapsed_s: float,
+    ) -> tuple[StageOutput, float]:
         if prepare_metadata:
             output.metadata.update(prepare_metadata)
+        request_extra = getattr(request, "extra", None)
+        if request_extra:
+            output.metadata.setdefault("request_extra", dict(request_extra))
         return output, elapsed_s
 
     def _make_record(

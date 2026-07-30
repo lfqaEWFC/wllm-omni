@@ -31,10 +31,13 @@
 
 ```text
 MiniOmniRuntime
-  ├── PipelineRegistry
-  │     ├── ar_text: ar.text_generation
+  ├── MiniOmniPlanner
+  │     ├── ar_text: ar.text_generation + AR text policy
   │     ├── wan_i2v: diffusion.wan22_i2v
-  │     └── qwen_to_wan_i2v: ar.prompt_bridge -> diffusion.wan22_i2v
+  │     └── qwen_to_wan_i2v: ar.prompt_bridge -> diffusion.wan22_i2v + bridge policy
+  │
+  ├── PipelineRegistry
+  │     └── materialized StageGraph configs
   │
   └── StageScheduler
         └── StageGraph(selected pipeline)
@@ -59,10 +62,36 @@ MiniOmniRuntime
 
 核心原则：
 
-- 顶层用 `--pipeline` 选择 `PipelineRegistry` 中已配置好的 stage graph
+- 顶层用 `--pipeline` 选择 `MiniOmniPlanner` / `PipelineRegistry` 中已配置好的 stage graph
+- `MiniOmniPlanner` 不根据 prompt 自动生成 graph，只把显式 pipeline 映射到静态 `MiniOmniPipelinePlan` 和 stage policy
 - `ModelRunner` 保持通用
 - AR / Diffusion 差异下沉到 executor 和 pipeline
-- AR streaming 不绕过 runner，而是通过 `RunnerOutput.events` 输出 token delta
+- AR streaming 不绕过 pipeline / stage scheduler / runner，而是通过 `StageScheduler.run_stream()` 和 `RunnerOutput.events` 输出 token delta
+- `Connector` 只负责跨 stage 请求转换，不负责执行 stage 或重新调度 stage graph
+
+## 当前中间版本边界
+
+这个版本可以作为单请求 mini-Omni runtime 的一个稳定中间点：上层已经有显式 pipeline plan、stage graph、stage scheduler 和 connector；下层仍保留每个模型范式自己的 scheduler / runner / executor。
+
+- `MiniOmniPlanner`：静态 planner。输入是 `pipeline` 名称，输出是 `MiniOmniPipelinePlan`，包含 stage nodes、edges、AR stage policy 和 stream 能力标记。
+- `PipelineRegistry`：把 planner 给出的 plan materialize 成 `StageGraph`，并校验节点和 connector。
+- `StageScheduler`：执行 stage graph，按照依赖顺序运行 stage，并通过 connector 生成下游 `OmniRequest`。它不理解 AR token、KV cache 或 diffusion denoise step。
+- `ARToDiffusionConnector`：保留用户原始 Wan prompt，将 Qwen 输出作为 supplemental guidance 追加；如果 AR 输出是坏 JSON、结构残缺或被 token budget 截断，就回退到原始 prompt。
+- `ar_text`：纯 AR 文本生成，使用 `ar.text_generation` 节点，不暴露用户态 max-token 参数，停止由模型 EOS / context window 决定。
+- `qwen_to_wan_i2v`：AR 只承担 prompt bridge，使用内部 stage token budget，输出契约是 `supplemental_guidance`，不是最终文本。
+
+## 与 vLLM-Omni 的对应关系
+
+| vLLM-Omni 风格职责       | 当前 mini 版本对应实现                                                                        | 当前边界                                                           |
+| ------------------------ | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Pipeline / workflow 选择 | `MiniOmniPlanner` + `PipelineRegistry`                                                    | 只支持显式配置好的`ar_text`、`wan_i2v`、`qwen_to_wan_i2v`    |
+| Stage graph              | `StageGraph`                                                                                | 单请求 DAG，V0 限制每个节点最多一个输入边                          |
+| Stage-level scheduler    | `StageScheduler`                                                                            | 按依赖顺序执行，不做 stage batching / overlap                      |
+| Per-model engine         | `AREngine` / `DiffusionEngine`                                                            | AR 用通用`RequestScheduler`，Diffusion 用 `StepScheduler`      |
+| Unified runner           | `ModelRunner`                                                                               | AR / Diffusion 都经过 runner，再由 executor 分发                   |
+| Model-family executor    | `ARExecutor` / `DiffusionExecutor`                                                        | 差异下沉到 executor 和 pipeline                                    |
+| Cross-stage connector    | `ARToDiffusionConnector`                                                                    | 只做请求转换和 prompt guidance merge                               |
+| Streaming                | `StageScheduler.run_stream()` -> `ARStage.run_stream()` -> `AREngine.generate_stream()` | 当前仅单 stage`ar_text` stream，多 stage stream 留到后续事件路由 |
 
 ## 安装
 
@@ -102,13 +131,12 @@ hf download Qwen/Qwen2.5-0.5B-Instruct \
 
 ### AR text
 
-`ar_text` 是普通文本生成 pipeline，graph 节点是 `ar.text_generation`，不会套 image-to-video prompt rewrite 模板。
+`ar_text` 是普通文本生成 pipeline，graph 节点是 `ar.text_generation`，不会套 image-to-video prompt rewrite 模板，也不暴露用户态 max-token 参数；停止条件由模型 EOS / 上下文窗口处理。
 
 ```text
 python example_wan22_i2v.py \
   --pipeline ar_text \
   --ar-model ./models/Qwen2.5-0.5B-Instruct \
-  --ar-max-new-tokens 1000 \
   --prompt "生成1000字的文本，描述一所学校"
 ```
 
@@ -119,7 +147,7 @@ python example_wan22_i2v.py \
   --pipeline ar_text \
   --ar-model ./models/Qwen2.5-0.5B-Instruct \
   --stream \
-  --prompt "A cat wearing sunglasses sits on a surfboard at the beach."
+  --prompt "生成1000字的文本，描述一所学校"
 ```
 
 ### Wan I2V
@@ -140,7 +168,7 @@ CUDA_VISIBLE_DEVICES=0 python example_wan22_i2v.py \
 
 ### Qwen -> Wan I2V
 
-`qwen_to_wan_i2v` 才会启用 AR prompt bridge，graph 节点是 `ar.prompt_bridge -> diffusion.wan22_i2v`：先把用户输入改写成适合 Wan I2V 的视觉 prompt，再交给 diffusion stage。
+`qwen_to_wan_i2v` 会启用 AR prompt bridge，graph 节点是 `ar.prompt_bridge -> diffusion.wan22_i2v`：Wan 原始 prompt 保持为主，Qwen 只生成 supplemental guidance；bridge 使用内部固定 token budget，坏结构或截断输出会回退原始 prompt。这个预算是 stage policy，不是用户 CLI 协议。
 
 ```text
 unset OMP_NUM_THREADS
@@ -154,8 +182,7 @@ CUDA_VISIBLE_DEVICES=0 python example_wan22_i2v.py \
   --disable-cpu-offload \
   --vae-dtype bf16 \
   --pipeline qwen_to_wan_i2v \
-  --ar-model ./models/Qwen2.5-0.5B-Instruct \
-  --ar-max-new-tokens 64
+  --ar-model ./models/Qwen2.5-0.5B-Instruct
 ```
 
 ## Trace 字段
@@ -193,6 +220,12 @@ diffusion.source_request_id
 diffusion.load_was_cold
 diffusion.load_ms
 diffusion.elapsed_ms
+diffusion.bridge_strategy
+diffusion.bridge_parse_success
+diffusion.bridge_fallback
+diffusion.bridge_fallback_reason
+diffusion.ar_guidance_prompt
+diffusion.prompt
 ```
 
 ## KV Cache 边界
@@ -218,9 +251,20 @@ ar.runtime_kv_manager=False
 ## 测试
 
 轻量协议测试：
+如果本地没有 `pytest`，可先安装：
+
+```text
+python -m pip install pytest
+```
 
 ```text
 python -m pytest tests/test_pipeline_protocol.py -q
+```
+
+Planner / connector 测试：
+
+```text
+python -m pytest tests/test_diffusion_plan.py -q
 ```
 
 AR stepwise / generate fidelity 测试：
@@ -229,17 +273,11 @@ AR stepwise / generate fidelity 测试：
 python -m pytest tests/test_ar_stepwise.py -q
 ```
 
-如果本地没有 `pytest`，可先安装：
-
-```text
-python -m pip install pytest
-```
-
 ## 下一步
 
 建议下一步继续做 AR 侧 runtime 优化：
 
-1. 先设计真正的 AR scheduler 语义：prefill queue、decode queue、token budget
+1. 先设计真正的 AR scheduler 语义：prefill queue、decode queue、decode stop policy
 2. 再引入 AR KV metadata / KV block manager 雏形
 3. 支持多请求 decode batching
 4. 继续推进 prefix cache、stream server、多 session 调度

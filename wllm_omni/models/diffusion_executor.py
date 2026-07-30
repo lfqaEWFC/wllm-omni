@@ -21,7 +21,7 @@ from wllm_omni.worker.utils import (
 
 
 class DiffusionExecutor(ModelExecutor):
-    """Step-wise diffusion executor used by the generic ModelRunner V1.
+    """Step-wise diffusion executor used by the generic ModelRunner V0.
 
     The executor owns diffusion-specific state and model calls. The generic
     runner only sees RequestState and ForwardBatch.
@@ -75,7 +75,7 @@ class DiffusionExecutor(ModelExecutor):
 
     def build_forward_batch(self, states: list[RequestState]) -> ForwardBatch:
         if len(states) != 1:
-            raise ValueError(f"DiffusionExecutor V1 supports exactly one request per forward batch, got {len(states)}.")
+            raise ValueError(f"DiffusionExecutor V0 supports exactly one request per forward batch, got {len(states)}.")
         state = states[0]
         payload = self._payload(state)
         phase = ExecutionPhase.PREPARE if not state.initialized else ExecutionPhase.STEP
@@ -87,7 +87,7 @@ class DiffusionExecutor(ModelExecutor):
         if batch.paradigm != self.paradigm:
             raise ValueError(f"DiffusionExecutor cannot run batch for paradigm={batch.paradigm}.")
         if len(batch.req_ids) != 1:
-            raise ValueError(f"DiffusionExecutor V1 supports exactly one request per forward batch, got {len(batch.req_ids)}.")
+            raise ValueError(f"DiffusionExecutor V0 supports exactly one request per forward batch, got {len(batch.req_ids)}.")
 
         payload = self._batch_payload(batch)
         profile = self._profiler(payload)

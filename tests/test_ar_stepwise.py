@@ -39,7 +39,7 @@ from wllm_omni.worker.utils import ExecutionPhase
 # ---------------------------------------------------------------------------
 
 PROMPT_IDS = [3, 8, 5, 7, 9, 4]
-MAX_NEW_TOKENS = 16
+TOKEN_BUDGET = 16
 
 
 def _tiny_qwen2_model():
@@ -116,25 +116,25 @@ class _RecordingTokenizer(_FakeTokenizer):
         return super().__call__(text, return_tensors=return_tensors)
 
 
-def _make_pipeline(model=None, max_new_tokens: int = MAX_NEW_TOKENS) -> TransformersARPipeline:
+def _make_pipeline(model=None, token_budget: int | None = TOKEN_BUDGET) -> TransformersARPipeline:
     pipeline = TransformersARPipeline.__new__(TransformersARPipeline)
     pipeline.model_path = "tiny/qwen2"
     pipeline.device = torch.device("cpu")
     pipeline.dtype = torch.float32
-    pipeline.max_new_tokens = max_new_tokens
+    pipeline.token_budget = token_budget
     pipeline.prompt_mode = AR_PROMPT_MODE_TEXT
     pipeline.tokenizer = _FakeTokenizer()
     pipeline.model = model if model is not None else _tiny_qwen2_model()
     return pipeline
 
 
-def _reference_generate(pipeline: TransformersARPipeline, max_new_tokens: int = MAX_NEW_TOKENS) -> list[int]:
+def _reference_generate(pipeline: TransformersARPipeline, token_budget: int | None = TOKEN_BUDGET) -> list[int]:
     """What the pre-P0 monolithic path produced: raw model.generate() ids."""
     inputs = pipeline._tokenize_prompt("hello world")
     with torch.no_grad():
         output_ids = pipeline.model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=token_budget,
             do_sample=False,
             pad_token_id=pipeline.tokenizer.eos_token_id,
         )
@@ -148,7 +148,7 @@ def _stepwise_output(pipeline: TransformersARPipeline) -> ARTextOutput:
     while not state.finished:
         state = pipeline.decode_step(state)
         steps += 1
-        assert steps <= pipeline.max_new_tokens, "decode loop must stop at max_new_tokens"
+        assert pipeline.token_budget is None or steps <= pipeline.token_budget, "decode loop must respect internal token budget"
     return pipeline.finalize(state)
 
 
@@ -163,7 +163,7 @@ def test_transformers_prompt_mode_controls_template_for_non_chat_tokenizer():
 
     pipeline.prompt_mode = AR_PROMPT_MODE_I2V_BRIDGE
     pipeline._tokenize_prompt("A cat on a surfboard")
-    assert "Rewrite the following image-to-video request" in tokenizer.last_text
+    assert "Produce only short supplemental motion/camera hints" in tokenizer.last_text
     assert "Request: A cat on a surfboard" in tokenizer.last_text
 
 
@@ -223,7 +223,7 @@ def test_eos_stop_triggers_and_matches_generate():
     pipeline.tokenizer.special_ids.add(eos_extra)
 
     reference = _reference_generate(pipeline)
-    assert len(reference) < MAX_NEW_TOKENS, "EOS stop must trigger before the token budget"
+    assert len(reference) < TOKEN_BUDGET, "EOS stop must trigger before the token budget"
     assert reference[-1] == eos_extra
 
     output = _stepwise_output(pipeline)
@@ -233,12 +233,12 @@ def test_eos_stop_triggers_and_matches_generate():
     assert output.metadata["token_count"] == len(reference)
 
 
-def test_max_new_tokens_zero_raises_like_generate():
+def test_token_budget_zero_raises_like_generate():
     """transformers rejects max_new_tokens=0; the stepwise path must surface
     the same validation error rather than silently emitting a token."""
-    pipeline = _make_pipeline(max_new_tokens=0)
+    pipeline = _make_pipeline(token_budget=0)
     with pytest.raises(ValueError, match="max_new_tokens"):
-        _reference_generate(pipeline, max_new_tokens=0)
+        _reference_generate(pipeline, token_budget=0)
     with pytest.raises(ValueError, match="max_new_tokens"):
         pipeline.prefill(OmniRequest(prompt="hello world"))
 
@@ -408,7 +408,7 @@ def test_identity_pipeline_single_shot_behavior_unchanged():
 
     item = output.outputs[0]
     assert item.finished is True and item.step_index == 1
-    assert item.result.metadata["mode"] == "identity_prompt_bridge"
+    assert item.result.metadata["mode"] == "identity_ar_pipeline"
     assert state.finished is True
 
 
@@ -429,7 +429,7 @@ def test_ar_engine_drives_multi_step_decode_with_request_scheduler():
 def test_ar_engine_still_works_with_identity_pipeline():
     engine = AREngine(EngineConfig(enable_mini_omni=True))  # defaults to IdentityARPipeline
     output = engine.generate(OmniRequest(prompt="a cat wearing sunglasses"))
-    assert output.metadata["mode"] == "identity_prompt_bridge"
+    assert output.metadata["mode"] == "identity_ar_pipeline"
     assert output.text == "a cat wearing sunglasses"
 
 

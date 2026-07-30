@@ -20,6 +20,7 @@ class OmniRequest:
     sampling_params: OmniSamplingParams = field(default_factory=lambda: clone_sampling_params(PRESETS["quality"]))
     model_paradigm: ModelParadigm = ModelParadigm.DIFFUSION
     request_id: str = field(default_factory=lambda: uuid4().hex)
+    extra: dict[str, object] = field(default_factory=dict)
 
     @property
     def batch_key(self) -> tuple:

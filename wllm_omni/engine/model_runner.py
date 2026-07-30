@@ -32,7 +32,7 @@ class ModelRunner:
     def execute(self, scheduler_output: SchedulerOutput) -> RunnerBatchOutput:
         """Execute the scheduled requests and return per-request outputs.
 
-        This is the V1 equivalent of SGLang's ScheduleBatch -> ForwardBatch
+        This is the current equivalent of SGLang's ScheduleBatch -> ForwardBatch
         boundary. The scheduler output stays CPU/request-level; each executor
         builds the family-specific ForwardBatch consumed by model forward.
         """

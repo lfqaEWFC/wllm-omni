@@ -53,6 +53,8 @@ class ARDecodeState:
     logits_processor: Any
     stopping_criteria: Any
     cache: Any = None
+    token_budget: int | None = None
+    context_window: int | None = None
     finished: bool = False
 
 
@@ -87,7 +89,7 @@ class IdentityARPipeline(ARPipeline):
             tokens=tokens,
             token_ids=[self._stable_token_id(token) for token in tokens],
             metadata={
-                "mode": "identity_prompt_bridge",
+                "mode": "identity_ar_pipeline",
                 "prompt_mode": "text",
                 "input_tokens": len(tokens),
                 "prefill_tokens": len(tokens),
@@ -122,7 +124,8 @@ class TransformersARPipeline(ARPipeline):
     """Local Transformers CausalLM backend with explicit prefill/decode split.
 
     The stepwise loop must be bit-identical to
-    ``model.generate(do_sample=False, max_new_tokens=..., pad_token_id=...)``.
+    ``model.generate(do_sample=False, pad_token_id=...)`` with an optional
+    internal stage token budget.
     To guarantee that, ``prefill`` builds the logits processors and stopping
     criteria through transformers' own ``_prepare_generation_config`` /
     ``_get_logits_processor`` / ``_get_stopping_criteria`` -- so checkpoint
@@ -139,7 +142,7 @@ class TransformersARPipeline(ARPipeline):
         device: str = "cuda",
         dtype: Any = None,
         local_files_only: bool = True,
-        max_new_tokens: int = 64,
+        token_budget: int | None = None,
         prompt_mode: str = AR_PROMPT_MODE_TEXT,
     ):
         import torch
@@ -150,7 +153,7 @@ class TransformersARPipeline(ARPipeline):
         self.dtype = dtype or torch.bfloat16
         if prompt_mode not in SUPPORTED_AR_PROMPT_MODES:
             raise ValueError(f"Unsupported AR prompt_mode={prompt_mode!r}.")
-        self.max_new_tokens = max_new_tokens
+        self.token_budget = token_budget
         self.prompt_mode = prompt_mode
         self.tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=local_files_only, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -186,15 +189,21 @@ class TransformersARPipeline(ARPipeline):
         input_length = int(input_ids.shape[-1])
 
         # Build the exact processor/criteria stack model.generate() would use
-        # for the equivalent call. _prepare_generation_config also validates
-        # arguments (e.g. rejects max_new_tokens<=0) exactly like generate().
-        generation_config, _ = self.model._prepare_generation_config(
-            None,
-            max_new_tokens=self.max_new_tokens,
-            do_sample=False,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
-        generation_config.max_length = input_length + self.max_new_tokens
+        # for the equivalent call. Pure AR text uses the model/context stop
+        # policy; bridge stages may set a small internal token budget.
+        generation_kwargs = {
+            "do_sample": False,
+            "pad_token_id": self.tokenizer.eos_token_id,
+        }
+        if self.token_budget is not None:
+            generation_kwargs["max_new_tokens"] = self.token_budget
+        generation_config, _ = self.model._prepare_generation_config(None, **generation_kwargs)
+        context_window = self._resolve_context_window(input_length)
+        if self.token_budget is not None:
+            generation_config.max_length = input_length + self.token_budget
+        else:
+            generation_config.max_new_tokens = None
+            generation_config.max_length = context_window
         self.model._prepare_special_tokens(
             generation_config,
             kwargs_has_attention_mask=True,
@@ -219,6 +228,8 @@ class TransformersARPipeline(ARPipeline):
             attention_mask=attention_mask,
             logits_processor=logits_processor,
             stopping_criteria=stopping_criteria,
+            token_budget=self.token_budget,
+            context_window=context_window,
         )
         return self._step(state)
 
@@ -261,7 +272,7 @@ class TransformersARPipeline(ARPipeline):
                 "prefill_tokens": state.input_length,
                 "token_count": len(token_ids),
                 "generated_tokens": len(token_ids),
-                "stop_reason": self._stop_reason(len(token_ids)),
+                "stop_reason": self._stop_reason(len(token_ids), state),
                 "streaming": False,
                 "kv_cache": state.cache is not None,
                 "kv_cache_type": cache_type,
@@ -363,8 +374,10 @@ class TransformersARPipeline(ARPipeline):
                 {
                     "role": "system",
                     "content": (
-                        "You rewrite user requests into concise visual prompts for image-to-video generation. "
-                        "Keep the main subject, scene, motion, and style. Return only the rewritten prompt."
+                        "You produce only short supplemental motion/camera hints for Wan image-to-video generation. "
+                        "Do not mention subject, breed, scene, lighting, style, quality, or composition. "
+                        "Return 3-6 comma-separated short phrases, max 25 words total. "
+                        "Do not output JSON, markdown, bullets, or explanations."
                     ),
                 },
                 {"role": "user", "content": prompt.strip()},
@@ -374,17 +387,38 @@ class TransformersARPipeline(ARPipeline):
             {"role": "user", "content": prompt.strip()},
         ]
 
-    def _stop_reason(self, generated_count: int) -> str:
-        if generated_count >= self.max_new_tokens:
-            return "max_tokens"
+    @staticmethod
+    def _stop_reason(generated_count: int, state: ARDecodeState) -> str:
+        if state.token_budget is not None and generated_count >= state.token_budget:
+            return "token_budget"
+        if state.context_window is not None and int(state.input_ids.shape[-1]) >= state.context_window:
+            return "context_limit"
         return "eos"
+
+    def _resolve_context_window(self, input_length: int) -> int:
+        candidates: list[int] = []
+        for value in (
+            getattr(self.tokenizer, "model_max_length", None),
+            getattr(getattr(self.model, "config", None), "max_position_embeddings", None),
+        ):
+            try:
+                candidate = int(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if input_length < candidate < 1_000_000:
+                candidates.append(candidate)
+        if candidates:
+            return min(candidates)
+        return max(input_length + 4096, 4096)
 
     def _build_prompt(self, prompt: str) -> str:
         text = prompt.strip()
         if self.prompt_mode == AR_PROMPT_MODE_I2V_BRIDGE:
             return (
-                "Rewrite the following image-to-video request as a concise, visual video generation prompt. "
-                "Keep the main subject, scene, motion, and style. Return only the rewritten prompt.\n\n"
+                "Produce only short supplemental motion/camera hints for the following Wan image-to-video request. "
+                "Do not mention subject, breed, scene, lighting, style, quality, or composition. "
+                "Return 3-6 comma-separated short phrases, max 25 words total. "
+                "Do not output JSON, markdown, bullets, or explanations.\n\n"
                 f"Request: {text}\nPrompt:"
             )
         return text
